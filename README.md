@@ -4,12 +4,34 @@ Ein fertiges, ausführlich getestetes Rezept zum Betreiben von **Qwen3.8-Flash-N
 
 ## Status
 
-- ✅ 5h+ stabile VSCode-Sessions ohne Loop-Abbrüche
+- ✅ **Der "!"-Loop ist tot** — 5h+ stabile VSCode-Sessions ohne einen einzigen KV-Korruptions-Loop (vor dem Fix: alle 1-2h bei ~33k oder ~145k Kontext)
 - ✅ ~35 tok/s Single-Stream, 85-95 tok/s aggregate
 - ✅ 262K Kontext, Chunked Prefill 2048
 - ✅ Speculative Decoding (EAGLE NEXTN, 3 Steps)
 - ✅ KDA Decode-Kernel + SM121 Triton Fallback
 - ✅ Automatischer Cache-Flush bei Detektion von KV-Korruption
+
+## Problem: Der "!!!!" Loop
+
+Qwen3.8-Flash-Next hat auf dem DGX Spark einen stochastischen Bug, der bei Chunked-Prefill + Radix-Cache eine korrupte KV-Seite produziert. Der Radix-Cache verewigt diese Korruption: jeder neue Request mit demselben Prefix kriegt auf Anhieb die korrupte Attention → das Modell produziert **Token 248319** (die letzte nie-trainierte Zeile des lm_head, dekodiert als `''` → vom Client als `"!"` dargestellt).
+
+**Symptome:**
+- Plötzliche "!!!!"-Ausgabe mitten in einer Session
+- Request terminiert nach 1-2 Tokens mit Token 248319
+- Alle nachfolgenden Requests mit gleicher History crashen identisch
+- `flush_cache` hilft temporär
+
+**Beweiskette:** Forensik-Dumps zeigen 4 aufeinanderfolgende Incidents mit **identischen** KV-Slot-Adressen und unterschiedlichen Mamba-Pool-Indizes — der Bug sitzt im KV-Cache, nicht im Modellzustand.
+
+## Der Fix: `disable_chunked_radix_insert`
+
+Die Wurzel ist ein Race zwischen Chunked-Prefill KV-Page-Insert in den Radix-Baum (`cache_unfinished_req`) und Pool-Deallocation bei Retract/Abort (`cache_finished_req`). Der Radix-Knoten überlebt mit hängenden Referenzen auf freigegebene Pages.
+
+**Lösung:** Der Radix-Insert wird während Chunked-Prefill übersprungen und erst nach Request-Commit in `cache_finished_req` ausgeführt. Damit referenziert der Radix-Baum nie Pages, während sie noch freigegeben werden können.
+
+Der Patch ist auto-enabled für QSA compressed-attention Modelle — kein manuelles Flag nötig.
+
+**Fallback:** Sollte dennoch eine Korruption auftreten, triggert der v6 Guard automatisch einen `flush_cache` im Hintergrund — unsichtbar für den laufenden Request.
 
 ## Patches in diesem Repo
 
