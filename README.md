@@ -1,120 +1,116 @@
 # Qwen3.8-Flash-Next — One DGX Spark Recipe
 
-Ein fertiges, ausführlich getestetes Rezept zum Betreiben von **Qwen3.8-Flash-Next 180B MoE (NVFP4)** auf einem einzelnen **NVIDIA DGX Spark (GB10)** — mit allen Patches, die den `"!" KV-Loop` endgültig besiegen.
+A battle-tested recipe for running **Qwen3.8-Flash-Next 180B MoE (NVFP4)** on a single **NVIDIA DGX Spark (GB10)** — with all patches that permanently fix the `"!" KV loop`.
 
 ## Status
 
-- ✅ **Der "!"-Loop ist tot** — 5h+ stabile VSCode-Sessions ohne einen einzigen KV-Korruptions-Loop (vor dem Fix: alle 1-2h bei ~33k oder ~145k Kontext)
-- ✅ ~35 tok/s Single-Stream, 85-95 tok/s aggregate
-- ✅ 262K Kontext, Chunked Prefill 2048
-- ✅ Speculative Decoding (EAGLE NEXTN, 3 Steps)
-- ✅ KDA Decode-Kernel + SM121 Triton Fallback
-- ✅ Automatischer Cache-Flush bei Detektion von KV-Korruption
+- ✅ **The "!" loop is dead** — 5h+ stable VSCode sessions with zero KV-corruption loops (pre-fix: every 1-2h at ~33k or ~145k context)
+- ✅ ~35 tok/s single-stream, 85-95 tok/s aggregate
+- ✅ 262K context, chunked prefill 2048
+- ✅ Speculative decoding (EAGLE NEXTN, 3 steps)
+- ✅ KDA decode kernel + SM121 Triton fallback
+- ✅ Auto flush on KV corruption detection
 
-## Problem: Der "!!!!" Loop
+## The "!!!!" Loop
 
-Qwen3.8-Flash-Next hat auf dem DGX Spark einen stochastischen Bug, der bei Chunked-Prefill + Radix-Cache eine korrupte KV-Seite produziert. Der Radix-Cache verewigt diese Korruption: jeder neue Request mit demselben Prefix kriegt auf Anhieb die korrupte Attention → das Modell produziert **Token 248319** (die letzte nie-trainierte Zeile des lm_head, dekodiert als `''` → vom Client als `"!"` dargestellt).
+Qwen3.8-Flash-Next on DGX Spark has a stochastic bug in the interaction between chunked prefill and the radix cache. A race condition produces a corrupted KV page; the radix cache then perpetuates that corruption — every subsequent request matching the same prefix reads the corrupt attention data and produces **token ID 248319** (the never-trained last row of `lm_head`, which decodes as `''` and appears as `"!"` in the client).
 
-**Symptome:**
-- Plötzliche "!!!!"-Ausgabe mitten in einer Session
-- Request terminiert nach 1-2 Tokens mit Token 248319
-- Alle nachfolgenden Requests mit gleicher History crashen identisch
-- `flush_cache` hilft temporär
+**Symptoms:**
+- Sudden `"!!!!"` output mid-session
+- Request terminates after 1-2 tokens with ID 248319
+- Every retry with the same history crashes identically
+- `flush_cache` resolves it temporarily
 
-**Beweiskette:** Forensik-Dumps zeigen 4 aufeinanderfolgende Incidents mit **identischen** KV-Slot-Adressen und unterschiedlichen Mamba-Pool-Indizes — der Bug sitzt im KV-Cache, nicht im Modellzustand.
+**Evidence:** 4 consecutive forensic incidents show **identical** KV slot addresses with varying mamba pool indices — the bug lives in the KV cache, not the model state.
 
-## Der Fix: `disable_chunked_radix_insert`
+## The Fix: `disable_chunked_radix_insert`
 
-Die Wurzel ist ein Race zwischen Chunked-Prefill KV-Page-Insert in den Radix-Baum (`cache_unfinished_req`) und Pool-Deallocation bei Retract/Abort (`cache_finished_req`). Der Radix-Knoten überlebt mit hängenden Referenzen auf freigegebene Pages.
+The root cause is a race between `cache_unfinished_req` (inserts KV pages into the radix tree mid-prefill) and `cache_finished_req` (frees pages on retract/abort). The radix node survives with dangling references to freed pages.
 
-**Lösung:** Der Radix-Insert wird während Chunked-Prefill übersprungen und erst nach Request-Commit in `cache_finished_req` ausgeführt. Damit referenziert der Radix-Baum nie Pages, während sie noch freigegeben werden können.
+**Solution:** Skip the radix insert during chunked prefill entirely — defer it to `cache_finished_req`, which runs after the request is fully committed and no longer subject to retraction. The radix tree never references pages while they can still be freed.
 
-Der Patch ist auto-enabled für QSA compressed-attention Modelle — kein manuelles Flag nötig.
+Auto-enabled for QSA compressed-attention models (no manual flag needed).
 
-**Fallback:** Sollte dennoch eine Korruption auftreten, triggert der v6 Guard automatisch einen `flush_cache` im Hintergrund — unsichtbar für den laufenden Request.
+**Fallback:** If corruption somehow still occurs, the v6 guard triggers a background `flush_cache` — transparent to the running request.
 
-## Patches in diesem Repo
+## Patches in This Repo
 
-| Patch | Datei | Zweck |
+| Patch | File | Purpose |
 |---|---|---|
-| `disable_chunked_radix_insert` | `server_args.py`, `mem_cache/*.py` | **Der "!"-Loop-Fix** — verhindert die Race-Condition zwischen Chunked-Prefill-Insert und Radix-Retract, die korrupte KV-Seiten erzeugt |
-| v6 impossible-token Guard | `batch_result_processor.py` | Erkennt Token-ID `248319` (out-of-vocab) sofort beim ersten Decode und terminiert den Request sauber |
-| Auto-Flush | `batch_result_processor.py` | Nach einer v6-Alarm-Auslösung wird automatisch `flush_cache` im Hintergrund getriggert — der korrupte Radix-Prefix wird geräumt |
-| Spezialisierte Attention-Overlays | `qwen_sparse_attn_backend.py`, `qsa_*.py`, `sm121_varlen.py`, `kda_kernels/` | SM121-optimierte QSA Sparse Attention + KDA Decode-Kernel (Triton + FlashInfer hybrid) |
-| Mamba extra_buffer | `qwen4_exp.py` | Hybrid Mamba-Attention-Radix-Cache für das Flash-Next-Modell |
-| Identical-run Guard deaktiviert | `batch_result_processor.py` | (Window=999999) — verhindert False Positives bei legitimen Testvektor-Ausgaben |
+| `disable_chunked_radix_insert` | `server_args.py`, `mem_cache/*.py` | **The "!" loop fix** — eliminates the chunked-prefill radix-insert race |
+| v6 impossible-token guard | `batch_result_processor.py` | Detects token ID `248319` on the very first decode step, terminates cleanly |
+| Auto-flush | `batch_result_processor.py` | Post-v6-trigger background `flush_cache` to clear the corrupt radix prefix |
+| KDA decode kernel + SM121 attention | `qwen_sparse_attn_backend.py`, `qsa_*.py`, `sm121_varlen.py`, `kda_kernels/` | SM121-optimized QSA sparse attention |
+| Mamba extra_buffer | `qwen4_exp.py` | Hybrid Mamba-attention radix cache for Flash-Next |
+| Identical-run guard disabled | `batch_result_processor.py` | Window=999999 — prevents false positives on legitimate number-list output |
 
-## Voraussetzungen
+## Requirements
 
 - 1× NVIDIA DGX Spark / GB10 (128 GB unified memory)
-- Docker installiert
-- ~126 GB freier Plattenplatz für Modell-Cache + PLE-Offload
-- Internet für Model-Download (einmalig)
+- Docker installed
+- ~126 GB free disk for model cache + PLE offload
+- Internet for one-time model download
 
-## Schnellstart
+## Quick Start
 
 ```bash
 git clone https://github.com/andreasknopke/qwen38-one-spark.git
 cd qwen38-one-spark
 
-# Start (ca. 9 Min Bootzeit)
+# Start (approx. 9 min boot time)
 MEMFRAC=0.79 PREFILL=2048 CTX=262144 bash serve.sh
 ```
 
-Die Umgebungsvariablen sind anpassbar:
+Configurable via environment variables:
 
-| Variable | Default | Beschreibung |
+| Variable | Default | Description |
 |---|---|---|
-| `MEMFRAC` | `0.79` | KV-Cache-Anteil am GPU-Speicher |
-| `CTX` | `262144` | Kontextlänge |
-| `PREFILL` | `2048` | Chunked-Prefill-Größe |
-| `SPEC` | `1` | Spec-Modus (`1`=NEXTN, `ring8`, `adaptive`) |
-| `PORT` | `30000` | Server-Port |
-| `KVDTYPE` | `auto` | KV-Cache-Datentyp |
-| `DEGEN_FORENSIC` | `1` | Debug-Logging für Degeneration |
+| `MEMFRAC` | `0.79` | KV cache fraction of GPU memory |
+| `CTX` | `262144` | Context length |
+| `PREFILL` | `2048` | Chunked prefill size |
+| `SPEC` | `1` | Spec mode (`1`=NEXTN, `ring8`, `adaptive`) |
+| `PORT` | `30000` | Server port |
+| `KVDTYPE` | `auto` | KV cache data type |
+| `DEGEN_FORENSIC` | `1` | Debug logging for degeneration |
 
 ## Details
 
-### Modell
+### Model
 
 - **Base**: `RadixArk/Qwen3.8-Flash-Next-NVFP4` (NVIDIA ModelOpt NVFP4)
-- **Architektur**: 180B MoE, 48 Layer, QSA Sparse Attention + Hybrid Mamba
-- **Quantisierung**: NVFP4 (experts), BF16 (restliche Layer)
-- **Context**: 262144 Tokens (maximal)
+- **Architecture**: 180B MoE, 48 layers, QSA sparse attention + hybrid mamba
+- **Quantization**: NVFP4 (experts), BF16 (remaining layers)
+- **Context**: 262144 tokens (maximum)
 
 ### Serving Stack
 
-Das Image `lmsysorg/sglang:qwen38flashnext` wird verwendet. Alle Patches werden per Bind-Mount eingespielt — kein eigener Docker-Build nötig.
+Uses the `lmsysorg/sglang:qwen38flashnext` image. All patches are applied via bind-mount — no custom Docker build needed.
 
 ### Attention Backend
 
 | Phase | Backend |
 |---|---|
 | Prefill | Triton (QSA sparse) |
-| Decode | `trtllm_mha` + KDA-Kernel |
+| Decode | `trtllm_mha` + KDA kernel |
 
-## Benchmark-Ergebnisse
-
-Siehe `~/forensics/`-Verzeichnis im laufenden Betrieb für aktuelle Forensik-Snapshots.
-
-## Repo-Struktur
+## Repository Structure
 
 ```
 .
-├── serve.sh                    # Start-Script (Docker)
-├── batch_result_processor.py   # Scheduler Guards (v6 + Auto-Flush)
-├── eagle_worker_v2.py          # EAGLE Spec-Decode
-├── kda_kernels/                # KDA Decode-Kernel
+├── serve.sh                    # Docker launch script
+├── batch_result_processor.py   # Scheduler guards (v6 + auto-flush)
+├── eagle_worker_v2.py          # EAGLE spec-decode
+├── kda_kernels/                # KDA decode kernel
 ├── mem_cache/                  # cache_init_params, kv_cache_builder, mamba_radix_cache
-├── qsa_graph_metadata.py       # QSA Graph Metadata
-├── qsa_kv_pool.py              # QSA KV Pool
-├── qsa_metadata.py             # QSA Metadata
-├── qwen4_exp.py                # Model Architecture (Qwen4-Exp)
-├── qwen_sparse_attn_backend.py # Sparse Attention Backend
-├── server_args.py              # Server Args (+ disable_chunked_radix_insert)
-└── sm121_varlen.py             # SM121 Triton Varlen Kernel
+├── qsa_graph_metadata.py       # QSA graph metadata
+├── qsa_kv_pool.py              # QSA KV pool
+├── qsa_metadata.py             # QSA metadata
+├── qwen4_exp.py                # Model architecture (Qwen4-Exp)
+├── qwen_sparse_attn_backend.py # Sparse attention backend
+├── server_args.py              # Server args (+ disable_chunked_radix_insert)
+└── sm121_varlen.py             # SM121 Triton varlen kernel
 ```
 
 ## History
 
-Dieses Repo entstand aus der praktischen Arbeit mit Qwen3.8-Flash-Next auf dem DGX Spark. Der ursprüngliche "!" KV-Loop (Issue [#38319](https://github.com/sgl-project/sglang/issues/38319)) wurde durch einen Chunked-Prefill-Radix-Insert-Race verursacht. Der Fix (`disable_chunked_radix_insert`) wurde als PR [#38355](https://github.com/sgl-project/sglang/pull/38355) eingereicht, aber nicht gemerged. Dieses Repo führt den Fix als Fork fort.
+This repo grew out of production work with Qwen3.8-Flash-Next on a single DGX Spark. The original `"!"` KV loop (issue [#38319](https://github.com/sgl-project/sglang/issues/38319)) was caused by a chunked-prefill radix-insert race. The fix (`disable_chunked_radix_insert`) was submitted as PR [#38355](https://github.com/sgl-project/sglang/pull/38355) but was not merged upstream. This repo carries the fix forward as a standalone fork.
