@@ -804,9 +804,22 @@ class SchedulerBatchResultProcessor:
                             f"mamba_pool_idx={_mamba_idx} mamba_ping_pong={_pp}"
                         )
                         req.skip_radix_cache_insert = True
-                        from sglang.srt.managers.schedule_batch import FINISH_LENGTH
-                        req.to_finish = FINISH_LENGTH(
-                            length=req.sampling_params.max_new_tokens
+                        # --- Silent correction (v6.1) ---
+                        # The previous v6 behaviour finished the request with
+                        # FINISH_LENGTH, which STREAMS the corrupt tokens to the
+                        # client -> the user sees "!!" and must click "try again".
+                        # Instead: (a) drop the junk output so nothing corrupt is
+                        # ever emitted, and (b) ABORT with a retryable reason so
+                        # the client treats it as a transient error and can resume
+                        # automatically once the flush has cleared the prefix.
+                        # NB: output_ids can be an array.array (no .clear()
+                        # pre-3.13) -> use slice deletion, not .clear().
+                        del req.output_ids[:]
+                        req.to_finish = FINISH_ABORT(
+                            message=(
+                                "kv_cache_corruption: impossible token detected; "
+                                "cache flushed, safe to retry"
+                            )
                         )
                         # Signal the auto-flush: the corrupt radix prefix must be
                         # cleared so the next request doesn't hit it. The flush

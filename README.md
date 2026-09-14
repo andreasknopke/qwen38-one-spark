@@ -31,14 +31,14 @@ The root cause is a race between `cache_unfinished_req` (inserts KV pages into t
 
 Auto-enabled for QSA compressed-attention models (no manual flag needed).
 
-**Fallback:** If corruption somehow still occurs, the v6 guard triggers a background `flush_cache` — transparent to the running request.
+**Fallback:** If corruption somehow still occurs, the v6 guard fires *before* the corrupt tokens are streamed: it drops the junk output (`del req.output_ids[:]`) and aborts the request with a retryable `FINISH_ABORT("kv_cache_corruption: ... safe to retry")`, then triggers a background `flush_cache`. The client never sees `!!` — it receives a transient-error abort it can retry automatically (silent correction).
 
 ## Patches in This Repo
 
 | Patch | File | Purpose |
 |---|---|---|
 | `disable_chunked_radix_insert` | `server_args.py`, `mem_cache/*.py` | **The "!" loop fix** — eliminates the chunked-prefill radix-insert race |
-| v6 impossible-token guard | `batch_result_processor.py` | Detects token ID `248319` on the very first decode step, terminates cleanly |
+| v6 impossible-token guard | `batch_result_processor.py` | Detects token ID `248319` on the very first decode step; drops junk output and aborts with a retryable reason (silent correction, no `!!` streamed) |
 | Auto-flush | `batch_result_processor.py` | Post-v6-trigger background `flush_cache` to clear the corrupt radix prefix |
 | KDA decode kernel + SM121 attention | `qwen_sparse_attn_backend.py`, `qsa_*.py`, `sm121_varlen.py`, `kda_kernels/` | SM121-optimized QSA sparse attention |
 | Mamba extra_buffer | `qwen4_exp.py` | Hybrid Mamba-attention radix cache for Flash-Next |
