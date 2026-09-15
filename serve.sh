@@ -8,7 +8,7 @@
 set -euo pipefail
 
 IMG=${IMG:-lmsysorg/sglang:qwen38flashnext}
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD="$ROOT/build"
 
 PLE_DIR=${PLE_DIR:-$HOME/flashnext-ple}   # mmap backing store; sparse, persists
