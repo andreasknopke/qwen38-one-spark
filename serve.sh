@@ -137,6 +137,7 @@ docker run -d --name "$NAME" \
     ${NO_RADIX:+--disable-radix-cache} \
     --context-length "$CTX" \
     --chunked-prefill-size "$PREFILL" \
+    --disable-chunked-radix-insert \
     --max-running-requests 4 \
     --allow-auto-truncate \
     --enable-metrics \
