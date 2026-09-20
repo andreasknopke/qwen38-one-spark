@@ -1,0 +1,3 @@
+# Merge-Versuche (Konflikt-Worktrees), nur lokal — siehe README.txt.
+# Der neue Layer nutzt ausschliesslich ../batch_result_processor.py.
+*.py
