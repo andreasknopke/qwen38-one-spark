@@ -37,11 +37,12 @@ NAME=${NAME:-flashnext-next}
 PORT=${PORT:-30000}
 RSS_BUDGET_GB=${RSS_BUDGET_GB:-8}
 
-for f in batch_result_processor.py path_degen.txt; do
+for f in batch_result_processor.py path_degen.txt mamba_radix_cache.py path_radix.txt; do
   [ -e "$BUILD/$f" ] || { echo "missing $BUILD/$f"; exit 1; }
 done
 mkdir -p "$PLE_DIR"
 PATH_DEGEN=$(cat "$BUILD/path_degen.txt")
+PATH_RADIX=$(cat "$BUILD/path_radix.txt")
 
 SPEC_ARGS=()
 if [ "$SPEC" = "1" ]; then
@@ -54,6 +55,11 @@ if [ "$SPEC" = "1" ]; then
   )
 fi
 
+# NB 24.09.: --disable-chunked-radix-insert existiert im qwen4-Branch nicht
+# mehr als CLI-Flag, aber die Race-Ursache ist weiterhin real (Loop-Stall
+# 24.09., 4 DEGEN-Onsets/4 rids in 2 min). Unser PR#38355-Fix ist deshalb
+# als Layer build-next/mamba_radix_cache.py portiert und wird via
+# SGLANG_DISABLE_CHUNKED_RADIX_INSERT=1 aktiviert (siehe mount unten).
 docker rm -f "$NAME" 2>/dev/null || true
 docker run -d --name "$NAME" \
   --gpus all --ipc host \
@@ -61,12 +67,14 @@ docker run -d --name "$NAME" \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
   -v "$PLE_DIR":/ple \
   -v "$BUILD/batch_result_processor.py":"$PATH_DEGEN":ro \
+  -v "$BUILD/mamba_radix_cache.py":"$PATH_RADIX":ro \
   -e SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB="$RSS_BUDGET_GB" \
   -e SGLANG_DEGEN_GUARD=1 \
   -e SGLANG_DEGEN_FORENSIC=${DEGEN_FORENSIC:-1} \
   -e SGLANG_DEGEN_WINDOW=999999 \
   -e SGLANG_DEGEN_IMPOSSIBLE_TOKEN=${DEGEN_IMPOSSIBLE_TOKEN:-1} \
   -e SGLANG_IMPOSSIBLE_TOKEN_MAX=${IMPOSSIBLE_TOKEN_MAX:-248077} \
+  -e SGLANG_DISABLE_CHUNKED_RADIX_INSERT=1 \
   "$IMG" \
   python3 -m sglang.launch_server \
     --model-path RadixArk/Qwen3.8-Flash-Next-NVFP4 \

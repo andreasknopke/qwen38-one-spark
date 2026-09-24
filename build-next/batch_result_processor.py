@@ -730,6 +730,18 @@ class SchedulerBatchResultProcessor:
                                 f"last_accept_len={len(accept_tokens)} "
                                 f"last_accept_ids={list(accept_tokens[:8])}"
                             )
+                            # --- v7: auto-flush on degenerate onset ---
+                            # The request is provably stuck (4 consecutive
+                            # verify steps with 0 accepted drafts). Whatever
+                            # its prefill wrote into the radix cache is the
+                            # poison source for the NEXT request with the same
+                            # prefix (seen 2026-09-24 09:01: three retries,
+                            # three identical degenerate onsets). Stop feeding
+                            # the cache and clear it as soon as the scheduler
+                            # is idle (the flush itself only succeeds then).
+                            req.skip_radix_cache_insert = True
+                            import sglang.srt.managers.scheduler_components.batch_result_processor as _brp
+                            _brp._auto_flush_pending = True
                         if _streak == 8:
                             req.skip_radix_cache_insert = True
                         if _streak == _streak_n:
@@ -1089,9 +1101,20 @@ class SchedulerBatchResultProcessor:
             _brp._auto_flush_pending = False
             import subprocess
 
+            # The flush only succeeds when the scheduler is idle. When the
+            # trigger comes from a forensic onset (v7) the offending request
+            # is still decoding (the guard ends it at the full streak), so a
+            # single one-shot POST would be swallowed. Retry in the
+            # background until the flush actually succeeds (~2 min budget),
+            # then log the outcome to the server log.
             subprocess.Popen(
-                ["curl", "-s", "-X", "POST", _brp._auto_flush_endpoint],
-                stdout=subprocess.DEVNULL,
+                'for i in $(seq 1 24); do '
+                'out=$(curl -s -m 5 -X POST ' + _brp._auto_flush_endpoint + '); '
+                'case "$out" in *uccess*) echo "[brp] cache flushed after '
+                'onset (try $i)"; exit 0;; esac; sleep 5; done; '
+                'echo "[brp] cache flush did not succeed within budget"',
+                shell=True,
+                stdout=None,  # erbt docker-log stdout -> Flush-Ergebnis sichtbar
                 stderr=subprocess.DEVNULL,
             )
 
