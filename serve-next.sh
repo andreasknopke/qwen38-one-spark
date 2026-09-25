@@ -37,12 +37,13 @@ NAME=${NAME:-flashnext-next}
 PORT=${PORT:-30000}
 RSS_BUDGET_GB=${RSS_BUDGET_GB:-8}
 
-for f in batch_result_processor.py path_degen.txt mamba_radix_cache.py path_radix.txt; do
+for f in batch_result_processor.py path_degen.txt mamba_radix_cache.py path_radix.txt tokenizer_manager.py path_tm.txt; do
   [ -e "$BUILD/$f" ] || { echo "missing $BUILD/$f"; exit 1; }
 done
 mkdir -p "$PLE_DIR"
 PATH_DEGEN=$(cat "$BUILD/path_degen.txt")
 PATH_RADIX=$(cat "$BUILD/path_radix.txt")
+PATH_TM=$(cat "$BUILD/path_tm.txt")
 
 SPEC_ARGS=()
 if [ "$SPEC" = "1" ]; then
@@ -68,6 +69,7 @@ docker run -d --name "$NAME" \
   -v "$PLE_DIR":/ple \
   -v "$BUILD/batch_result_processor.py":"$PATH_DEGEN":ro \
   -v "$BUILD/mamba_radix_cache.py":"$PATH_RADIX":ro \
+  -v "$BUILD/tokenizer_manager.py":"$PATH_TM":ro \
   -e SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB="$RSS_BUDGET_GB" \
   -e SGLANG_DEGEN_GUARD=1 \
   -e SGLANG_DEGEN_FORENSIC=${DEGEN_FORENSIC:-1} \
@@ -75,6 +77,7 @@ docker run -d --name "$NAME" \
   -e SGLANG_DEGEN_IMPOSSIBLE_TOKEN=${DEGEN_IMPOSSIBLE_TOKEN:-1} \
   -e SGLANG_IMPOSSIBLE_TOKEN_MAX=${IMPOSSIBLE_TOKEN_MAX:-248077} \
   -e SGLANG_DISABLE_CHUNKED_RADIX_INSERT=1 \
+  -e SGLANG_ORPHAN_ABORT=1 \
   "$IMG" \
   python3 -m sglang.launch_server \
     --model-path RadixArk/Qwen3.8-Flash-Next-NVFP4 \
